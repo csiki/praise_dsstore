@@ -1,3 +1,8 @@
 #!/bin/bash
 
-python3 generate && python3 visualize
+mkdir _demo_folder
+mkdir _demo_folder/SubFolder
+touch _demo_folder/Screenshot.png
+touch _demo_folder/Readme.txt
+
+python3 generate && python3 visualize ./_demo_folder
