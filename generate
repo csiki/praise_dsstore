@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""
+Make a .DS_Store from a hardcoded Python dictionary that describes
+Finder visuals (icon positions, view style, window bounds, etc.).
+
+Requires:
+    pip install ds-store
+
+Tested with:
+    macOS (current), Python 3.9+
+
+Notes:
+- Uses 'ds_store' to write a valid DS_Store file Finder understands.
+- You can extend the SPEC dict below with more records per file/folder.
+- For the folder itself, use the special filename "." (a single dot).
+"""
+
+import os
+import plistlib
+from ds_store import DSStore  # docs: https://ds-store.readthedocs.io/
+
+# ----------------------------
+# Helpers: encode DS_Store values
+# ----------------------------
+
+def fourcc(s: str) -> bytes:
+    """Encode a FourCharCode (exactly 4 ASCII bytes)."""
+    s = (s or "")[:4]
+    if len(s) != 4:
+        raise ValueError(f"FourCC must be 4 chars, got {repr(s)}")
+    return s.encode("ascii")
+
+def to_plist_blob(d: dict) -> bytes:
+    """Encode a dict to a binary plist (for bwsp/icvp/lsvp/lsvP records)."""
+    return plistlib.dumps(d, fmt=plistlib.FMT_BINARY)
+
+def make_fwi0_blob(top: int, left: int, bottom: int, right: int, view: str = "icnv") -> bytes:
+    """
+    fwi0 16-byte blob + 8 bytes = 24 total:
+      - 4 x 2-byte signed shorts: top, left, bottom, right (content rect)
+      - 4 bytes: view FourCC (icnv, clmv, Nlsv)
+      - 4 bytes: unknown (often 0 or 00 01 00 00)
+    """
+    import struct
+    return struct.pack(">hhhh4sI", top, left, bottom, right, fourcc(view), 0)
+
+def make_BKGD_default() -> bytes:
+    # 12-byte blob: "DefB" + 8 bytes (Apple leaves junk; we zero them)
+    return fourcc("DefB") + b"\x00" * 8
+
+def make_BKGD_color_rgb(r: int, g: int, b: int) -> bytes:
+    """
+    12-byte blob: "ClrB" + 6 bytes RGB + 2 unknown bytes.
+    RGB are 0..255 stored as 16-bit big-endian? Reverse notes say 6 bytes RGB.
+    We'll use single bytes then pad (Finder tolerates minor variance). 
+    For safety, pack as 6 raw bytes (0..255), then 2 zeros.
+    """
+    rgb = bytes([r & 0xFF, g & 0xFF, b & 0xFF]) + b"\x00\x00\x00"
+    # ensure exactly 6 bytes; above gives 6 by adding 3 zero padding bytes
+    rgb = rgb[:6]
+    return fourcc("ClrB") + rgb + b"\x00\x00"
+
+def set_entry(ds, fname: str, code: str, value):
+    """
+    Map our Python values to DS_Store typed entries.
+    Known mappings:
+      - Iloc:          tuple (x, y)  -> ds_store encodes blob
+      - bwsp/icvp/...: dict          -> encode as binary plist blob
+      - vstl:          FourCC string -> ('type', b'xxxx')
+      - fwvh/icvt/lsvt: int          -> ('shor', int)
+      - fwsw/logS/...: int           -> ('long', int)
+      - cmmt/extn:     str           -> ('ustr', text)
+      - BKGD:          dict or str   -> ('blob', bytes)  (default/color only here)
+      - fwi0:          dict          -> ('blob', bytes)
+      - Any unknown:   pass through if already ('typecode', value)
+    """
+    fname = str(fname)
+
+    if code == "Iloc":
+        # Accept (x, y) tuple; ds_store knows how to encode Iloc to blob
+        ds[fname]["Iloc"] = tuple(value)
+        return
+
+    if code in ("bwsp", "icvp", "lsvp", "lsvP"):
+        if isinstance(value, dict):
+            ds[fname][code] = ("blob", to_plist_blob(value))
+            return
+        raise ValueError(f"{code} expects a dict (plist data)")
+
+    if code == "vstl":
+        # View style FourCC: icnv (icon), clmv (column), Nlsv (list), Flwv (cover flow/gallery)
+        ds[fname]["vstl"] = ("type", fourcc(value))
+        return
+
+    if code in ("fwvh", "icvt", "lsvt"):
+        ds[fname][code] = ("shor", int(value))
+        return
+
+    if code in ("fwsw", "logS", "lg1S", "vSrn"):
+        ds[fname][code] = ("long", int(value))
+        return
+
+    if code in ("cmmt", "extn"):
+        ds[fname][code] = ("ustr", str(value))
+        return
+
+    if code == "BKGD":
+        # Support 'default' or {'type': 'color', 'rgb': (r,g,b)}
+        if value == "default":
+            blob = make_BKGD_default()
+        elif isinstance(value, dict) and value.get("type") == "color":
+            r, g, b = value.get("rgb", (255, 255, 255))
+            blob = make_BKGD_color_rgb(r, g, b)
+        else:
+            raise ValueError("BKGD supports 'default' or {'type':'color','rgb':(r,g,b)} here.")
+        ds[fname]["BKGD"] = ("blob", blob)
+        return
+
+    if code == "fwi0":
+        if not isinstance(value, dict):
+            raise ValueError("fwi0 expects dict: {top,left,bottom,right,view}")
+        blob = make_fwi0_blob(
+            value.get("top", 0),
+            value.get("left", 0),
+            value.get("bottom", 600),
+            value.get("right", 800),
+            value.get("view", "icnv"),
+        )
+        ds[fname]["fwi0"] = ("blob", blob)
+        return
+
+    # If user already passed a low-level ('typecode', value) tuple, accept it
+    if isinstance(value, tuple) and len(value) == 2 and isinstance(value[0], str):
+        ds[fname][code] = value
+        return
+
+    # Fallback: reject unknown mapping to avoid corrupt entries
+    raise ValueError(f"Unknown/unsupported record code '{code}' or invalid value: {value!r}")
+
+
+# ----------------------------
+# Example SPEC (edit this)
+# ----------------------------
+SPEC = {
+    # Settings for the folder itself -> use "."
+    ".": {
+        # Always open in ICON view
+        "vstl": "icnv",
+
+        # Icon view options (modern plist)
+        "icvp": {
+            "iconSize": 72,
+            "textSize": 13,
+            "gridSpacing": 100,
+            "showIconPreview": True,
+            "showItemInfo": False,
+            "labelOnBottom": True,
+            "arrangeBy": "",           # "" / "none" to keep manual placement
+            "scrollPositionX": 0,
+            "scrollPositionY": 0,
+            "gridOffsetX": 0,
+            "gridOffsetY": 0,
+            "viewOptionsVersion": 1,
+            # Optional background via icvp backgroundType + color keys:
+            "backgroundType": 1,       # 0=default, 1=solid color, 2=picture (plist varies by OS)
+            "backgroundColorRed": 0.98,
+            "backgroundColorGreen": 0.98,
+            "backgroundColorBlue": 0.98,
+        },
+
+        # Window settings (modern plist)
+        "bwsp": {
+            "WindowBounds": "{{200, 120}, {900, 640}}",  # AppKit window string
+            "ShowSidebar": True,
+            "ShowToolbar": True,
+            "ShowStatusBar": False,
+            "ShowPathbar": True,
+            "SidebarWidth": 200.0,
+            # Optional: "ViewStyle": "icnv",
+        },
+
+        # Legacy window rect & view (Finder still tolerates it)
+        "fwi0": {"top": 0, "left": 0, "bottom": 600, "right": 800, "view": "icnv"},
+
+        # Optional legacy-ish extras
+        "fwvh": 600,      # window height override (shor)
+        "fwsw": 200,      # sidebar width (long)
+        "vSrn": 1,        # seen as 1 on modern macOS (long)
+        # Folder background via BKGD (default or color). For picture backgrounds you’d also need 'pict' alias bytes.
+        "BKGD": "default",
+    },
+
+    # Individual items: place their icons at (x, y) in icon view
+    "Readme.txt": {"Iloc": (160, 160), "cmmt": "Important notes"},
+    "Screenshot.png": {"Iloc": (360, 160)},
+    "SubFolder": {"Iloc": (160, 360), "dscl": True},  # dscl=True = open in list view (parent)
+}
+
+
+def write_ds_store(folder_path: str, spec: dict):
+    """
+    Create/overwrite .DS_Store in folder_path using the given spec dict.
+
+    spec structure:
+      {
+        ".": { <record_code>: <value>, ... },
+        "filename": { <record_code>: <value>, ... },
+        ...
+      }
+
+    Examples of <value>:
+      - Iloc: (x, y)
+      - icvp/bwsp/lsvp/lsvP: dict (will be stored as binary plist)
+      - vstl: "icnv" | "clmv" | "Nlsv" | "Flwv"
+      - fwvh/icvt/lsvt: int   (short)
+      - fwsw/logS/lg1S/vSrn: int   (long)
+      - cmmt/extn: str  (Unicode)
+      - BKGD: "default" or {"type":"color","rgb":(r,g,b)}
+      - fwi0: {"top":..,"left":..,"bottom":..,"right":..,"view":"icnv"}
+      - low-level: (typecode, rawvalue) e.g. ('type', b'icnv'), ('blob', b'...')
+    """
+    os.makedirs(folder_path, exist_ok=True)
+    ds_path = os.path.join(folder_path, ".DS_Store")
+
+    # Create/overwrite .DS_Store
+    with DSStore.open(ds_path, "w+") as ds:
+        # Apply entries in a deterministic order (sorted filenames, then codes)
+        for fname in sorted(spec.keys(), key=lambda s: s.lower()):
+            for code in sorted(spec[fname].keys()):
+                set_entry(ds, fname, code, spec[fname][code])
+
+        ds.flush()
+
+    return ds_path
+
+
+if __name__ == "__main__":
+    # Change this to the target folder you want to decorate
+    target_folder = "./_demo_folder"
+
+    path = write_ds_store(target_folder, SPEC)
+    print(f"Wrote {path}")
+    print("Now open that folder in Finder to see your layout.\n"
+          "Tip: ensure View → Sort By → None for manual icon placement.")

@@ -1,0 +1,494 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Visualize a macOS .DS_Store layout as an HTML page (cross-platform).
+- Reads icon positions (Iloc), icon view options (icvp), window settings (bwsp),
+  background (BKGD or icvp backgroundColor*), etc.
+- Renders a simulated Finder window with icons and labels at correct positions.
+
+Usage:
+    python dsstore_visualize.py /path/to/folder
+
+Requires:
+    pip install ds-store
+"""
+
+import os
+import re
+import sys
+import html
+import json
+import plistlib
+from pathlib import Path
+
+# 3rd-party
+from ds_store import DSStore
+
+# -----------------------------
+# Helpers: parsing + defaults
+# -----------------------------
+
+def parse_window_bounds(bounds_str):
+    """
+    Parse AppKit WindowBounds string like "{{x, y}, {w, h}}".
+    Returns (x, y, w, h) as ints.
+    """
+    if not bounds_str:
+        return (100, 100, 800, 600)
+    m = re.match(r"\{\{\s*([-\d.]+)\s*,\s*([-\d.]+)\s*\}\s*,\s*\{\s*([-\d.]+)\s*,\s*([-\d.]+)\s*\}\}", bounds_str)
+    if not m:
+        return (100, 100, 800, 600)
+    x, y, w, h = map(float, m.groups())
+    return (int(round(x)), int(round(y)), int(round(w)), int(round(h)))
+
+def fourcc_bytes_to_str(b):
+    try:
+        return b.decode("ascii")
+    except Exception:
+        return repr(b)
+
+def get_blob_as_plist(blob):
+    try:
+        return plistlib.loads(blob)
+    except Exception:
+        return None
+
+def get_icvp_settings(icvp_blob):
+    """
+    icvp is a binary plist with keys like:
+      iconSize, textSize, gridSpacing, showIconPreview, showItemInfo,
+      labelOnBottom, arrangeBy, scrollPositionX/Y, gridOffsetX/Y,
+      viewOptionsVersion, backgroundType (0=default, 1=color, 2=picture),
+      backgroundColorRed/Green/Blue (floats 0..1)
+    """
+    d = get_blob_as_plist(icvp_blob) or {}
+    # Defaults if missing
+    icon_size = int(d.get("iconSize", 64))
+    text_size = int(d.get("textSize", 12))
+    label_on_bottom = bool(d.get("labelOnBottom", True))
+    scroll_x = int(d.get("scrollPositionX", 0))
+    scroll_y = int(d.get("scrollPositionY", 0))
+    arrange_by = d.get("arrangeBy", "") or ""
+    bg_type = int(d.get("backgroundType", 0))
+    bg_col = None
+    if bg_type == 1:
+        r = float(d.get("backgroundColorRed", 1.0))
+        g = float(d.get("backgroundColorGreen", 1.0))
+        b = float(d.get("backgroundColorBlue", 1.0))
+        bg_col = (r, g, b)
+    return {
+        "iconSize": icon_size,
+        "textSize": text_size,
+        "labelOnBottom": label_on_bottom,
+        "scrollX": scroll_x,
+        "scrollY": scroll_y,
+        "arrangeBy": arrange_by,
+        "backgroundType": bg_type,
+        "backgroundColor": bg_col,
+        "raw": d,
+    }
+
+def get_bwsp_settings(bwsp_blob):
+    """
+    bwsp is a binary plist with keys like:
+      WindowBounds, SidebarWidth, ShowSidebar, ShowToolbar, ShowStatusBar, ShowPathbar, ViewStyle (opt)
+    """
+    d = get_blob_as_plist(bwsp_blob) or {}
+    bounds = parse_window_bounds(d.get("WindowBounds"))
+    sidebar_w = d.get("SidebarWidth", 0)
+    return {
+        "bounds": bounds,  # (x, y, w, h)
+        "ShowSidebar": bool(d.get("ShowSidebar", False)),
+        "ShowToolbar": bool(d.get("ShowToolbar", True)),
+        "ShowStatusBar": bool(d.get("ShowStatusBar", False)),
+        "ShowPathbar": bool(d.get("ShowPathbar", False)),
+        "SidebarWidth": float(sidebar_w) if sidebar_w is not None else 0.0,
+        "ViewStyle": d.get("ViewStyle", None),
+        "raw": d,
+    }
+
+def rgb_float_to_css(rgb):
+    if not rgb:
+        return None
+    r, g, b = rgb
+    # clamp 0..1
+    r = max(0.0, min(1.0, r))
+    g = max(0.0, min(1.0, g))
+    b = max(0.0, min(1.0, b))
+    return f"rgb({int(r*255)}, {int(g*255)}, {int(b*255)})"
+
+def parse_iloc_blob(value):
+    """
+    The ds-store lib already returns Iloc as a (x, y) tuple when reading in Python.
+    But if we ever see bytes, keep a fallback here (big-endian two 4-byte ints).
+    """
+    if isinstance(value, tuple) and len(value) == 2:
+        return int(value[0]), int(value[1])
+    if isinstance(value, (bytes, bytearray)) and len(value) >= 8:
+        x = int.from_bytes(value[0:4], "big", signed=True)
+        y = int.from_bytes(value[4:8], "big", signed=True)
+        return x, y
+    return None
+
+# -----------------------------
+# Main extraction
+# -----------------------------
+
+def extract_dsstore(folder: Path):
+    """
+    Read .DS_Store in 'folder' and return a structured dict:
+      {
+        "meta": {
+            "window": {...},
+            "iconView": {...},
+            "backgroundColor": "rgb(...)" or None,
+        },
+        "items": [
+            {"name": "...", "x": 123, "y": 456, "comment": "...", "extn": "..."},
+            ...
+        ]
+      }
+    """
+    ds_path = folder / ".DS_Store"
+    if not ds_path.exists():
+        raise FileNotFoundError(f"No .DS_Store found at: {ds_path}")
+
+    meta = {
+        "window": {"x": 100, "y": 100, "w": 800, "h": 600},
+        "iconView": {
+            "iconSize": 64,
+            "textSize": 12,
+            "labelOnBottom": True,
+            "scrollX": 0,
+            "scrollY": 0,
+            "arrangeBy": "",
+        },
+        "backgroundColor": "#ffffff",
+        "viewStyle": "icnv",
+    }
+    items = []
+
+    with DSStore.open(str(ds_path), "r") as ds:
+        # Collect filenames present in DS_Store
+        try:
+            filenames = sorted(ds.keys(), key=lambda s: s.lower())
+        except Exception:
+            # Fallback: iterate by trying common approach
+            filenames = []
+            for name in ds:
+                filenames.append(name)
+            filenames = sorted(set(filenames), key=lambda s: s.lower())
+
+        for name in filenames:
+            # DS_Store uses "." for the folder’s own records
+            try:
+                records = ds[name]
+            except Exception:
+                # Some libs expose mapping-like but need list of codes:
+                # fallback: discover codes via known list
+                records = {}
+
+            # Pull folder-level meta
+            if name == ".":
+                # View style ('vstl' type FourCC)
+                if "vstl" in records:
+                    try:
+                        tcode = records["vstl"]
+                        if isinstance(tcode, (bytes, bytearray)):
+                            meta["viewStyle"] = fourcc_bytes_to_str(tcode)
+                        elif isinstance(tcode, tuple) and tcode[0] == "type":
+                            meta["viewStyle"] = fourcc_bytes_to_str(tcode[1])
+                        else:
+                            meta["viewStyle"] = str(tcode)
+                    except Exception:
+                        pass
+
+                # bwsp plist (window)
+                if "bwsp" in records:
+                    val = records["bwsp"]
+                    if isinstance(val, tuple) and val[0] == "blob":
+                        bw = get_bwsp_settings(val[1])
+                    elif isinstance(val, (bytes, bytearray)):
+                        bw = get_bwsp_settings(val)
+                    else:
+                        bw = None
+                    if bw:
+                        x, y, w, h = bw["bounds"]
+                        meta["window"] = {"x": x, "y": y, "w": w, "h": h}
+
+                # icvp plist (icon view)
+                if "icvp" in records:
+                    val = records["icvp"]
+                    if isinstance(val, tuple) and val[0] == "blob":
+                        ic = get_icvp_settings(val[1])
+                    elif isinstance(val, (bytes, bytearray)):
+                        ic = get_icvp_settings(val)
+                    else:
+                        ic = None
+                    if ic:
+                        meta["iconView"].update({k: ic[k] for k in ("iconSize", "textSize", "labelOnBottom", "scrollX", "scrollY", "arrangeBy")})
+                        if ic["backgroundColor"]:
+                            meta["backgroundColor"] = rgb_float_to_css(ic["backgroundColor"])
+
+                # Fallback background from BKGD (color variant only)
+                if meta["backgroundColor"] == "#ffffff" and "BKGD" in records:
+                    val = records["BKGD"]
+                    blob = None
+                    if isinstance(val, tuple) and val[0] == "blob":
+                        blob = val[1]
+                    elif isinstance(val, (bytes, bytearray)):
+                        blob = val
+                    if blob and len(blob) >= 12 and blob[:4] == b"ClrB":
+                        # Next 6 bytes are RGB; map 0..255 to CSS
+                        r, g, b = blob[4], blob[5], blob[6]
+                        meta["backgroundColor"] = f"rgb({r}, {g}, {b})"
+
+                continue  # done with folder meta
+
+            # Item-level (files/subfolders)
+            entry = {"name": name, "x": None, "y": None, "comment": None, "extn": None}
+            # Iloc
+            if "Iloc" in records:
+                coord = parse_iloc_blob(records["Iloc"])
+                if coord:
+                    entry["x"], entry["y"] = coord
+            # comment (cmmt)
+            if "cmmt" in records:
+                val = records["cmmt"]
+                if isinstance(val, str):
+                    entry["comment"] = val
+                elif isinstance(val, tuple) and val[0] == "ustr":
+                    entry["comment"] = val[1]
+            # extn (if present)
+            if "extn" in records:
+                val = records["extn"]
+                if isinstance(val, str):
+                    entry["extn"] = val
+                elif isinstance(val, tuple) and val[0] == "ustr":
+                    entry["extn"] = val[1]
+
+            # Only include items we can actually draw (have coordinates)
+            if entry["x"] is not None and entry["y"] is not None:
+                items.append(entry)
+
+    return {"meta": meta, "items": items}
+
+
+# -----------------------------
+# HTML rendering
+# -----------------------------
+
+HTML_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>.DS_Store Preview – {title}</title>
+<style>
+  body {{
+    margin: 20px;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+    background: #f6f7f8;
+    color: #111;
+  }}
+  .window {{
+    position: relative;
+    width: {win_w}px;
+    height: {win_h}px;
+    border: 1px solid #c7c7c7;
+    border-radius: 10px;
+    background: {bg};
+    overflow: hidden;
+    box-shadow: 0 8px 24px rgba(0,0,0,0.08);
+    background-clip: padding-box;
+  }}
+  .titlebar {{
+    height: 28px;
+    background: linear-gradient(to bottom, #e7e7e7, #d5d5d5);
+    border-bottom: 1px solid #c1c1c1;
+    display: flex;
+    align-items: center;
+    padding: 0 12px;
+    font-size: 12px;
+  }}
+  .content {{
+    position: absolute;
+    left: 0;
+    top: 28px;
+    width: 100%;
+    height: calc(100% - 28px);
+    overflow: auto;
+    background: transparent;
+  }}
+  .canvas {{
+    position: relative;
+    width: {canvas_w}px;
+    height: {canvas_h}px;
+    background: transparent;
+    background-image: radial-gradient(#ddd 1px, transparent 1px);
+    background-size: 32px 32px; /* subtle grid to visualize layout */
+  }}
+  .icon {{
+    position: absolute;
+    width: {icon}px;
+    height: {icon}px;
+    margin-left: -{icon_half}px;  /* center icon on coordinate */
+    margin-top: -{icon_half}px;
+    border-radius: 12px;
+    border: 1px solid rgba(0,0,0,0.15);
+    background: white;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    user-select: none;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.12);
+  }}
+  .label {{
+    position: absolute;
+    top: {label_offset_top}px;
+    width: {label_w}px;
+    margin-left: -{label_w_half}px;
+    text-align: center;
+    font-size: {text}px;
+    color: #111;
+    text-shadow: 0 1px 0 rgba(255,255,255,0.6);
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }}
+  .bubble {{
+    font-size: {text}px;
+    padding: 2px 6px;
+    background: rgba(255,255,160,0.8);
+    border: 1px solid rgba(0,0,0,0.15);
+    border-radius: 6px;
+    position: absolute;
+    top: {-label_offset_top - 26}px;
+    transform: translateX(-50%);
+  }}
+  .legend {{
+    margin-top: 10px;
+    font-size: 12px;
+    color: #333;
+  }}
+</style>
+</head>
+<body>
+
+<h2>.DS_Store Preview — {title}</h2>
+<div class="window">
+  <div class="titlebar">View: {view_style} • Icon Size: {icon}px • Text Size: {text}px • Arrange By: {arrange_by or 'none'} • Scroll: ({scroll_x}, {scroll_y})</div>
+  <div class="content" style="scroll-left:{scroll_x}px; scroll-top:{scroll_y}px;">
+    <div class="canvas">
+{icons_html}
+    </div>
+  </div>
+</div>
+
+<div class="legend">
+  <strong>Notes:</strong>
+  Coordinates are the center of each icon (Finder stores centers). The light grid is 32px spacing.
+  Background color is taken from icvp (if present) or white. This is a visualization — exact pixel-perfect
+  match to Finder chrome may vary, but icon placement and sizes reflect the stored values.
+</div>
+
+<details style="margin-top: 16px;">
+  <summary>Raw meta JSON</summary>
+  <pre>{meta_json}</pre>
+</details>
+
+</body>
+</html>
+"""
+
+def render_html(folder: Path, data: dict) -> str:
+    meta = data["meta"]
+    items = data["items"]
+
+    win = meta.get("window", {"w": 800, "h": 600})
+    w = max(100, int(win.get("w", 800)))
+    h = max(100, int(win.get("h", 600)))
+
+    iv = meta.get("iconView", {})
+    icon = int(iv.get("iconSize", 64))
+    text = int(iv.get("textSize", 12))
+    scroll_x = int(iv.get("scrollX", 0))
+    scroll_y = int(iv.get("scrollY", 0))
+    arrange_by = iv.get("arrangeBy", "") or ""
+
+    bg = meta.get("backgroundColor", "#ffffff") or "#ffffff"
+
+    # Canvas bounds: ensure all icons fit
+    max_x = max((p["x"] for p in items), default=icon) + icon * 2
+    max_y = max((p["y"] for p in items), default=icon) + icon * 2
+    canvas_w = max(w, max_x)
+    canvas_h = max(h, max_y)
+    label_offset_top = icon // 2 + 8  # label below icon
+    label_w = max(icon + 24, 120)
+    label_w_half = label_w // 2
+
+    icons_html = []
+    for it in items:
+        name = it["name"]
+        x, y = int(it["x"]), int(it["y"])
+        label = html.escape(name)
+        comment = it.get("comment")
+
+        icon_div = f'''      <div class="icon" style="left:{x}px; top:{y}px;" title="{label}"></div>'''
+        label_div = f'''      <div class="label" style="left:{x}px; top:{y}px;">{label}</div>'''
+        bubble_div = ""
+        if comment:
+            bubble_div = f'''      <div class="bubble" style="left:{x}px; top:{y}px;">{html.escape(comment)}</div>'''
+        icons_html.append(icon_div)
+        icons_html.append(label_div)
+        if bubble_div:
+            icons_html.append(bubble_div)
+
+    icons_html_str = "\n".join(icons_html)
+    meta_json = html.escape(json.dumps(meta, indent=2, ensure_ascii=False))
+
+    html_out = HTML_TEMPLATE.format(
+        title=html.escape(str(folder)),
+        win_w=w,
+        win_h=h,
+        bg=bg,
+        canvas_w=canvas_w,
+        canvas_h=canvas_h,
+        icon=icon,
+        icon_half=icon // 2,
+        label_offset_top=label_offset_top,
+        label_w=label_w,
+        label_w_half=label_w_half,
+        text=text,
+        view_style=html.escape(meta.get("viewStyle", "icnv")),
+        arrange_by=html.escape(arrange_by),
+        scroll_x=scroll_x,
+        scroll_y=scroll_y,
+        icons_html=icons_html_str,
+        meta_json=meta_json,
+    )
+    return html_out
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: python dsstore_visualize.py /path/to/folder")
+        sys.exit(2)
+
+    folder = Path(sys.argv[1]).expanduser().resolve()
+    if not folder.exists():
+        print(f"Folder not found: {folder}")
+        sys.exit(1)
+
+    try:
+        data = extract_dsstore(folder)
+    except Exception as e:
+        print(f"Error reading .DS_Store: {e}")
+        sys.exit(1)
+
+    html_str = render_html(folder, data)
+    out_path = folder / "dsstore_preview.html"
+    out_path.write_text(html_str, encoding="utf-8")
+    print(f"✓ Wrote {out_path}")
+    print("Open it in a browser to view the Finder layout preview.")
+
+if __name__ == "__main__":
+    main()
