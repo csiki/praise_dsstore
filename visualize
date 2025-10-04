@@ -171,7 +171,7 @@ def extract_dsstore(folder: Path):
     with DSStore.open(str(ds_path), "r") as ds:
         # Collect filenames present in DS_Store
         try:
-            filenames = sorted(ds.keys(), key=lambda s: s.lower())
+            filenames = sorted({e.filename for e in ds}, key=lambda s: s.lower())
         except Exception:
             # Fallback: iterate by trying common approach
             filenames = []
@@ -179,14 +179,13 @@ def extract_dsstore(folder: Path):
                 filenames.append(name)
             filenames = sorted(set(filenames), key=lambda s: s.lower())
 
-        for name in filenames:
-            # DS_Store uses "." for the folder’s own records
-            try:
-                records = ds[name]
-            except Exception:
-                # Some libs expose mapping-like but need list of codes:
-                # fallback: discover codes via known list
-                records = {}
+        records_by_file = {}
+        for entry in ds:
+            fname = entry.filename
+            code = entry.code.decode("ascii") if isinstance(entry.code, (bytes, bytearray)) else str(entry.code)
+            records_by_file.setdefault(fname, {})[code] = entry.value
+
+        for name, records in records_by_file.items():
 
             # Pull folder-level meta
             if name == ".":
@@ -362,7 +361,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     border: 1px solid rgba(0,0,0,0.15);
     border-radius: 6px;
     position: absolute;
-    top: {-label_offset_top - 26}px;
+    top: {bubble_offset_top}px;
     transform: translateX(-50%);
   }}
   .legend {{
@@ -376,7 +375,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
 <h2>.DS_Store Preview — {title}</h2>
 <div class="window">
-  <div class="titlebar">View: {view_style} • Icon Size: {icon}px • Text Size: {text}px • Arrange By: {arrange_by or 'none'} • Scroll: ({scroll_x}, {scroll_y})</div>
+  <div class="titlebar">View: {view_style} • Icon Size: {icon}px • Text Size: {text}px • Arrange By: {arrange_by_str} • Scroll: ({scroll_x}, {scroll_y})</div>
   <div class="content" style="scroll-left:{scroll_x}px; scroll-top:{scroll_y}px;">
     <div class="canvas">
 {icons_html}
@@ -425,6 +424,8 @@ def render_html(folder: Path, data: dict) -> str:
     label_offset_top = icon // 2 + 8  # label below icon
     label_w = max(icon + 24, 120)
     label_w_half = label_w // 2
+    bubble_offset_top = -(label_offset_top + 26)
+    arrange_by_str = arrange_by if arrange_by else "none"
 
     icons_html = []
     for it in items:
@@ -465,6 +466,8 @@ def render_html(folder: Path, data: dict) -> str:
         scroll_y=scroll_y,
         icons_html=icons_html_str,
         meta_json=meta_json,
+        bubble_offset_top=bubble_offset_top,
+        arrange_by_str=html.escape(arrange_by_str),
     )
     return html_out
 

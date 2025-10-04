@@ -104,6 +104,10 @@ def set_entry(ds, fname: str, code: str, value):
         ds[fname][code] = ("ustr", str(value))
         return
 
+    if code in ("ICVO", "LSVO", "dscl"):
+        ds[fname][code] = ("bool", bool(value))
+        return
+
     if code == "BKGD":
         # Support 'default' or {'type': 'color', 'rgb': (r,g,b)}
         if value == "default":
